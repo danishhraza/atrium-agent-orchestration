@@ -15,7 +15,8 @@ from sqlmodel import delete, select
 
 from . import llm, rag, router, security, telemetry
 from .config import TIERS, settings
-from .db import Agent, AgentBox, Box, Chunk, Document, Message, RunLog, Task, User, ensure_user, init_db, session
+from .db import (Agent, AgentBox, Box, Chunk, Document, Message, Room, RunLog, Task, User, create_room,
+                 ensure_user, init_db, orchestrator, session)
 from .runtime import runtime
 from .seed import seed_demo
 from .tools import OPTIONAL
@@ -50,7 +51,12 @@ def owned(model, id_: str, user_id: str):
     return obj
 
 
+class RoomIn(BaseModel):
+    name: str
+
+
 class AgentIn(BaseModel):
+    room_id: str | None = None  # required when creating; an agent cannot move rooms
     name: str | None = None
     role: str | None = None
     instructions: str | None = None
@@ -67,7 +73,8 @@ class BoxIn(BaseModel):
 
 
 class ChatIn(BaseModel):
-    agent_id: str | None = None  # None = the orchestrator
+    room_id: str | None = None   # with no agent_id: talk to this room's orchestrator
+    agent_id: str | None = None
     content: str
 
 
@@ -93,13 +100,13 @@ def _settings_view(user: User) -> dict:
 
 
 def _apply(agent: Agent, data: AgentIn, user_id: str) -> None:
-    fields = data.model_dump(exclude_unset=True, exclude={"box_ids"})
+    fields = data.model_dump(exclude_unset=True, exclude={"box_ids", "room_id"})
     if fields.get("tier") and fields["tier"] not in ("auto", *TIERS):
         raise HTTPException(422, "tier must be auto, fast, balanced or smart")
     with session() as s:
         if "parent_id" in fields and fields["parent_id"]:
             seen, cur = {agent.id}, s.get(Agent, fields["parent_id"])
-            if not cur or cur.user_id != user_id or cur.is_orchestrator:
+            if not cur or cur.user_id != user_id or cur.room_id != agent.room_id or cur.is_orchestrator:
                 fields["parent_id"] = None  # reporting to the orchestrator is the default, stored as None
             while cur and not cur.is_orchestrator:  # walk up: refuse reporting cycles
                 if cur.id in seen:
@@ -117,18 +124,66 @@ def _apply(agent: Agent, data: AgentIn, user_id: str) -> None:
         s.commit()
 
 
-@app.get("/api/state")
-def state(user: str = Depends(current_user)):
+def room_of(room_id: str | None, user: str) -> Room:
+    """The requested room, or the user's first room when none is named."""
+    return owned(Room, room_id, user) if room_id else ensure_user(user)
+
+
+@app.get("/api/rooms")
+def list_rooms(user: str = Depends(current_user)):
     with session() as s:
-        agents = s.exec(select(Agent).where(Agent.user_id == user).order_by(Agent.created_at)).all()
+        rooms = s.exec(select(Room).where(Room.user_id == user).order_by(Room.created_at)).all()
+        counts = dict(s.exec(select(Agent.room_id, func.count()).where(Agent.user_id == user).group_by(Agent.room_id)).all())
+    return [{**r.model_dump(mode="json"), "agents": counts.get(r.id, 0)} for r in rooms]
+
+
+@app.post("/api/rooms")
+def new_room(data: RoomIn, user: str = Depends(current_user)):
+    if not data.name.strip():
+        raise HTTPException(422, "name is required")
+    return create_room(user, data.name.strip())
+
+
+@app.patch("/api/rooms/{room_id}")
+def rename_room(room_id: str, data: RoomIn, user: str = Depends(current_user)):
+    room = owned(Room, room_id, user)
+    room.name = data.name.strip() or room.name
+    with session() as s:
+        s.merge(room)
+        s.commit()
+    return room
+
+
+@app.delete("/api/rooms/{room_id}")
+def delete_room(room_id: str, user: str = Depends(current_user)):
+    """Deletes the room's agents, tasks and conversation. Knowledge boxes are account-wide and stay."""
+    owned(Room, room_id, user)
+    with session() as s:
+        if s.exec(select(func.count()).select_from(Room).where(Room.user_id == user)).one() <= 1:
+            raise HTTPException(422, "you need at least one room")
+        agent_ids = s.exec(select(Agent.id).where(Agent.room_id == room_id)).all()
+        s.exec(delete(AgentBox).where(AgentBox.agent_id.in_(agent_ids)))
+        for model in (Message, Task, Agent):
+            s.exec(delete(model).where(model.room_id == room_id))
+        s.delete(s.get(Room, room_id))
+        s.commit()
+    return {"ok": True}
+
+
+@app.get("/api/state")
+def state(room_id: str | None = None, user: str = Depends(current_user)):
+    room = room_of(room_id, user)
+    with session() as s:
+        agents = s.exec(select(Agent).where(Agent.room_id == room.id).order_by(Agent.created_at)).all()
         boxes = s.exec(select(Box).where(Box.user_id == user)).all()
         docs = s.exec(select(Document).where(Document.user_id == user)).all()
         links = s.exec(select(AgentBox).where(AgentBox.agent_id.in_([a.id for a in agents]))).all()
-        tasks = s.exec(select(Task).where(Task.user_id == user).order_by(Task.created_at.desc()).limit(100)).all()
-        msgs = s.exec(select(Message).where(Message.user_id == user).order_by(Message.created_at.desc()).limit(200)).all()
+        tasks = s.exec(select(Task).where(Task.room_id == room.id).order_by(Task.created_at.desc()).limit(100)).all()
+        msgs = s.exec(select(Message).where(Message.room_id == room.id).order_by(Message.created_at.desc()).limit(200)).all()
         me = s.get(User, user)
     idle = {"state": "idle", "detail": "", "peer": None}
     return {
+        "room": room.model_dump(mode="json"),
         "agents": [{**a.model_dump(mode="json"), **runtime.states.get(a.id, idle),
                     "box_ids": [l.box_id for l in links if l.agent_id == a.id]} for a in agents],
         "boxes": [{**b.model_dump(), "documents": [d.model_dump(mode="json") for d in docs if d.box_id == b.id]} for b in boxes],
@@ -143,7 +198,7 @@ def state(user: str = Depends(current_user)):
 def create_agent(data: AgentIn, user: str = Depends(current_user)):
     if not data.name:
         raise HTTPException(422, "name is required")
-    agent = Agent(user_id=user, name=data.name)
+    agent = Agent(user_id=user, room_id=room_of(data.room_id, user).id, name=data.name)
     _apply(agent, data, user)
     return agent
 
@@ -207,7 +262,7 @@ async def upload(box_id: str, file: UploadFile, user: str = Depends(current_user
 
 @app.post("/api/chat")
 async def chat(data: ChatIn, user: str = Depends(current_user)):
-    agent = owned(Agent, data.agent_id, user) if data.agent_id else ensure_user(user)
+    agent = owned(Agent, data.agent_id, user) if data.agent_id else orchestrator(room_of(data.room_id, user).id)
     return await runtime.chat(agent, data.content)
 
 
@@ -229,10 +284,11 @@ def feedback(message_id: str, data: FeedbackIn, user: str = Depends(current_user
 
 
 @app.post("/api/demo")
-async def demo(user: str = Depends(current_user)):
+async def demo(room_id: str | None = None, user: str = Depends(current_user)):
+    room = room_of(room_id, user)
     try:
         key = "" if settings.embedding_model == "local" else llm.creds(user).key
-        return {"created": await seed_demo(user, key)}
+        return {"created": await seed_demo(user, room.id, key)}
     except llm.MissingKey as e:
         raise HTTPException(422, str(e))
 
@@ -240,7 +296,9 @@ async def demo(user: str = Depends(current_user)):
 @app.get("/api/public")
 def public_config():
     """Unauthenticated: what the login screen needs. The Clerk publishable key is public by design."""
-    return {"clerk_publishable_key": settings.clerk_publishable_key, "dev_auth": settings.dev_auth}
+    # Dev auth wins: the backend ignores tokens then, so the page must not ask for a login either.
+    key = "" if settings.dev_auth else settings.clerk_publishable_key
+    return {"clerk_publishable_key": key, "dev_auth": settings.dev_auth}
 
 
 @app.put("/api/settings")

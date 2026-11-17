@@ -16,6 +16,8 @@ export interface Agent {
   peer: string | null;
 }
 
+export interface RoomInfo { id: string; name: string; created_at: string; agents?: number }
+
 export interface Doc { id: string; filename: string; n_chunks: number }
 export interface Box { id: string; name: string; description: string; documents: Doc[] }
 
@@ -29,6 +31,7 @@ export interface Task {
   parent_id: string | null;
   result: string;
   handoffs: number;
+  room_id: string;
   created_at: string;
 }
 
@@ -40,6 +43,7 @@ export interface Message {
   content: string;
   task_id: string | null;
   trace_id: string | null;
+  room_id: string;
   created_at: string;
 }
 
@@ -58,7 +62,7 @@ export interface StatRow { key: string; runs: number; judged: number; avg_score:
 export interface RouterStats { by_tier: StatRow[]; by_router: StatRow[]; trained_tiers: Record<string, number>; usable: boolean; min_samples: number }
 export interface TrainResult { samples: number; tiers_trained: string[]; usable: boolean }
 
-export interface State { agents: Agent[]; boxes: Box[]; tasks: Task[]; messages: Message[]; settings: Settings; config: Config }
+export interface State { room: RoomInfo; agents: Agent[]; boxes: Box[]; tasks: Task[]; messages: Message[]; settings: Settings; config: Config }
 
 export type Event =
   | { type: "state"; agent_id: string; state: AgentState; detail: string; peer: string | null }
@@ -89,9 +93,13 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
 
 export const api = {
   publicConfig: () => fetch("/api/public").then((r) => r.json() as Promise<{ clerk_publishable_key: string; dev_auth: boolean }>),
-  state: () => req<State>("GET", "/state"),
+  state: (roomId: string | null) => req<State>("GET", roomId ? `/state?room_id=${roomId}` : "/state"),
+  rooms: () => req<RoomInfo[]>("GET", "/rooms"),
+  createRoom: (name: string) => req<RoomInfo>("POST", "/rooms", { name }),
+  renameRoom: (id: string, name: string) => req<RoomInfo>("PATCH", `/rooms/${id}`, { name }),
+  deleteRoom: (id: string) => req("DELETE", `/rooms/${id}`),
   chat: (agent_id: string, content: string) => req<Message>("POST", "/chat", { agent_id, content }),
-  saveAgent: (id: string | null, data: Partial<Agent>) =>
+  saveAgent: (id: string | null, data: Partial<Agent> & { room_id?: string }) =>
     id ? req<Agent>("PATCH", `/agents/${id}`, data) : req<Agent>("POST", "/agents", data),
   deleteAgent: (id: string) => req("DELETE", `/agents/${id}`),
   createBox: (name: string, description: string) => req<Box>("POST", "/boxes", { name, description }),
@@ -103,7 +111,7 @@ export const api = {
   },
   retryTask: (id: string) => req<{ restarted: number }>("POST", `/tasks/${id}/retry`),
   feedback: (messageId: string, value: number) => req("POST", `/messages/${messageId}/feedback`, { value }),
-  demo: () => req("POST", "/demo"),
+  demo: (roomId: string) => req("POST", `/demo?room_id=${roomId}`),
   saveSettings: (data: Partial<Settings> & { openrouter_key?: string } & Record<string, unknown>) => req<Settings>("PUT", "/settings", data),
   models: () => req<Model[]>("GET", "/models"),
   routerStats: () => req<RouterStats>("GET", "/router"),

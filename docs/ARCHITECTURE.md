@@ -32,7 +32,12 @@ own OpenRouter key.
 ## Decisions, and why
 
 **Hierarchy: a tree with the orchestrator at the root, parents optional.**
-Every user gets one orchestrator. Agents report to it by default; an agent can instead report to
+**Rooms.** A user has any number of rooms ("Sales team", "Research desk"). Each room is a separate
+team with its own orchestrator, agents, conversation and tasks; agents can only see, delegate to or
+message teammates in their own room. Knowledge boxes, the API key and the learned router belong to
+the account, so one box can be granted to agents in several rooms.
+
+Every room gets one orchestrator. Agents report to it by default; an agent can instead report to
 another agent, which makes that agent a *lead*. Delegation follows the tree (the orchestrator can
 delegate to anyone, a lead only to its direct reports), and results flow back up the same path: when
 all of a parent's subtasks finish, the parent is re-run to synthesize them. The same two mechanisms
@@ -104,19 +109,26 @@ mission) · `Message(sender, recipient, kind)` is the full communication log · 
 
 One relational database holds everything, including the vectors. Locally that is a SQLite file
 (`backend/data/atrium.db`); in production it is whatever Postgres `ATRIUM_DATABASE_URL` points at
-(for Supabase or Neon, use the Postgres **connection string**, not an API or anon key). Tables are
-created on first start.
+(for Supabase or Neon, use the Postgres **connection string**, not an API or anon key).
+
+**Schema changes go through Alembic** (`backend/migrations/`). The app runs `alembic upgrade head` on
+startup, so a deploy migrates itself. A database created before migrations existed is stamped at
+the baseline (`0001`) first, then upgraded; migration `0002` added rooms and moved each user's existing
+agents, tasks and messages into a "Main room", so no data is lost. After changing a model in
+`app/db.py`, run `uv run alembic revision --autogenerate -m "..."` from `backend/` and review the file:
+autogenerate does not know how to backfill existing rows (see `0002_rooms.py` for the pattern).
 
 | Table | One row per | Key columns | Scoped by |
 |---|---|---|---|
+| `room` | team workspace | name | `user_id` |
 | `user` | signed-in person (id = Clerk user id) | encrypted OpenRouter key, key hint, tier models, judge on/off, router mode, explore rate | is the scope |
-| `agent` | agent | name, role, instructions, tier, model override, tools, `parent_id` (reports to), `is_orchestrator` | `user_id` |
+| `agent` | agent | name, role, instructions, tier, model override, tools, `parent_id` (reports to), `is_orchestrator` | `user_id`, `room_id` |
 | `box` | knowledge box | name, description | `user_id` |
 | `agentbox` | agent-to-box grant | `agent_id`, `box_id` | via agent and box |
 | `document` | uploaded file | filename, chunk count, `box_id` | `user_id` |
 | `chunk` | passage of a document | text, `embedding` (float32 bytes), `box_id`, `document_id` | via box |
-| `task` | unit of work | title, brief, status, assignee, creator, `parent_id`, result, handoffs, trace id | `user_id` |
-| `message` | anything anyone said | sender, recipient, kind, content, task id, trace id | `user_id` |
+| `task` | unit of work | title, brief, status, assignee, creator, `parent_id`, result, handoffs, trace id | `user_id`, `room_id` |
+| `message` | anything anyone said | sender, recipient, kind, content, task id, trace id | `user_id`, `room_id` |
 | `runlog` | agent run | tier, routed_by, model, tokens, cost, latency, judge score, request text | `user_id` |
 | `routermodel` | trained router | weights, sample count, trained at | `user_id` (primary key) |
 
@@ -181,7 +193,6 @@ how a mission fanned out.
 |---|---|---|
 | SQLite by default; Postgres via `ATRIUM_DATABASE_URL` | any deployment | set the URL (no Docker needed with a hosted Postgres) |
 | Brute-force cosine in numpy | > ~50k chunks | pgvector; only `rag.search` changes |
-| Tables created on start, no migrations | first schema change in production | Alembic |
 | In-process asyncio task runner | work must survive a restart | a durable queue (Arq/Celery/Temporal); `Runtime.execute` is already the unit of work |
 | Router trains on demand (button) | steady traffic | retrain on a schedule; pool anonymised data across users for cold start |
 | Three built-in optional tools | users need their own systems | MCP client: let users attach MCP servers per agent |

@@ -1,4 +1,10 @@
-"""Data model. Every row is scoped to a user_id so the platform is multi-tenant by construction."""
+"""Data model. Every row is scoped to a user_id so the platform is multi-tenant by construction.
+
+A user owns several rooms. Each room is a separate team: its own orchestrator, agents, chat and tasks.
+Knowledge boxes, the API key and the learned router belong to the user, so they are shared across rooms.
+
+Schema changes go through Alembic (backend/migrations); see init_db().
+"""
 import os
 import uuid
 from datetime import datetime, timezone
@@ -30,14 +36,23 @@ class User(SQLModel, table=True):
     explore_rate: float = 0.1          # share of auto-routed tasks sent to a random tier, to gather training data
 
 
+class Room(SQLModel, table=True):
+    """A separate team and workspace: its own orchestrator, agents, conversation and tasks."""
+    id: str = Field(default_factory=new_id, primary_key=True)
+    user_id: str = Field(index=True)
+    name: str
+    created_at: datetime = Field(default_factory=now)
+
+
 class Agent(SQLModel, table=True):
     id: str = Field(default_factory=new_id, primary_key=True)
     user_id: str = Field(index=True)
+    room_id: str = Field(index=True)
     name: str
     role: str = ""                 # one line: what this agent is for (used for routing)
     instructions: str = ""         # free-form system prompt written by the user
     tier: str = "auto"             # fast | balanced | smart | auto (difficulty-routed)
-    model: str | None = None       # explicit LiteLLM model, overrides tier
+    model: str | None = None       # explicit OpenRouter model id, overrides tier
     tools: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     parent_id: str | None = None   # "reports to" - None means reports to the orchestrator
     is_orchestrator: bool = False
@@ -78,6 +93,7 @@ class Task(SQLModel, table=True):
     """A unit of work. A task with no parent assigned to the orchestrator is a 'mission'."""
     id: str = Field(default_factory=new_id, primary_key=True)
     user_id: str = Field(index=True)
+    room_id: str = Field(index=True)
     title: str
     brief: str = ""
     status: str = "pending"        # pending | in_progress | waiting | done | failed
@@ -95,6 +111,7 @@ class Message(SQLModel, table=True):
     """Everything anyone said to anyone. sender/recipient are agent ids or "user"."""
     id: str = Field(default_factory=new_id, primary_key=True)
     user_id: str = Field(index=True)
+    room_id: str = Field(index=True)
     sender: str
     recipient: str
     kind: str                      # chat | delegate | handoff | consult | reply | result | report
@@ -143,16 +160,35 @@ engine = create_engine(settings.db_url, pool_pre_ping=True,
                        connect_args={"check_same_thread": False} if _sqlite else {"prepare_threshold": None})
 
 
+BASELINE = "0001"  # the schema as it was before migrations existed (created by SQLModel.create_all)
+
+
 def init_db() -> None:
-    SQLModel.metadata.create_all(engine)
+    """Bring the database schema up to date by running Alembic migrations.
+
+    A database created before migrations existed already has the baseline tables but no
+    alembic_version table; it is stamped at the baseline first so only newer migrations run.
+    """
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import inspect
+
+    cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "migrations"))
+    with engine.begin() as conn:
+        cfg.attributes["connection"] = conn
+        tables = set(inspect(conn).get_table_names())
+        if "alembic_version" not in tables and "agent" in tables:
+            command.stamp(cfg, BASELINE)
+        command.upgrade(cfg, "head")
 
 
 def session() -> Session:
     return Session(engine, expire_on_commit=False)
 
 
-def ensure_user(user_id: str) -> Agent:
-    """Create the user and their orchestrator on first sight; return the orchestrator."""
+def ensure_user(user_id: str) -> Room:
+    """Create the user and their first room on first sight. Returns their oldest room."""
     with session() as s:
         if not s.get(User, user_id):
             s.add(User(id=user_id))
@@ -160,12 +196,21 @@ def ensure_user(user_id: str) -> Agent:
                 s.commit()
             except IntegrityError:  # two first requests raced; the other one created the row
                 s.rollback()
-        orch = s.exec(select(Agent).where(Agent.user_id == user_id, Agent.is_orchestrator)).first()
-        if not orch:
-            orch = Agent(
-                user_id=user_id, name=settings.orchestrator_name, is_orchestrator=True, tier="balanced",
-                role="Orchestrator: routes requests to the right agent and reports back",
-            )
-            s.add(orch)
-            s.commit()
-        return orch
+        room = s.exec(select(Room).where(Room.user_id == user_id).order_by(Room.created_at)).first()
+    return room or create_room(user_id, "Main room")
+
+
+def create_room(user_id: str, name: str) -> Room:
+    """A room always starts with its own orchestrator."""
+    with session() as s:
+        room = Room(user_id=user_id, name=name)
+        s.add(room)
+        s.add(Agent(user_id=user_id, room_id=room.id, name=settings.orchestrator_name, is_orchestrator=True,
+                    tier="balanced", role="Orchestrator: routes requests to the right agent and reports back"))
+        s.commit()
+        return room
+
+
+def orchestrator(room_id: str) -> Agent:
+    with session() as s:
+        return s.exec(select(Agent).where(Agent.room_id == room_id, Agent.is_orchestrator)).one()

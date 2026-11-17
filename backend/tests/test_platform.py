@@ -4,6 +4,7 @@ These guard invariants that must never depend on model behaviour: knowledge-box 
 lifecycle, handoff limits, auth, key handling. Model *quality* is measured separately in evals/.
 """
 import random
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -12,7 +13,7 @@ from sqlmodel import select
 
 from app import llm, rag, router, security
 from app.config import settings
-from app.db import Agent, Message, RunLog, Task, User, ensure_user, session
+from app.db import Agent, Message, Room, RunLog, Task, User, create_room, ensure_user, orchestrator, session
 from app.main import app
 from app.runtime import runtime
 from app.seed import seed_demo
@@ -34,7 +35,7 @@ def give_key(user: str, judge: bool = False) -> None:
 
 async def team(user: str, judge: bool = False) -> dict[str, Agent]:
     give_key(user, judge)
-    await seed_demo(user, KEY)
+    await seed_demo(user, ensure_user(user).id, KEY)
     with session() as s:
         return {a.name: a for a in s.exec(select(Agent).where(Agent.user_id == user)).all()}
 
@@ -100,7 +101,7 @@ async def test_handoff_moves_the_task_to_a_new_owner(monkeypatch):
         return await fake_llm.complete(key, model, messages, tools, name)
 
     monkeypatch.setattr(llm, "complete", scripted)
-    task = Task(user_id="u-handoff", title="Who is the contact at Harbor Logistics?", assignee_id=t["Quinn"].id)
+    task = Task(user_id="u-handoff", room_id=t["Quinn"].room_id, title="Who is the contact at Harbor Logistics?", assignee_id=t["Quinn"].id)
     runtime.save_task(task)
     await runtime.execute(task.id)
     await runtime.idle()
@@ -164,7 +165,7 @@ async def test_retry_resumes_only_the_failed_subtask(monkeypatch):
 # ------------------------------ keys and auth ------------------------------
 
 async def test_without_a_key_the_agent_asks_for_one():
-    orch = ensure_user("u-nokey")
+    orch = orchestrator(ensure_user("u-nokey").id)
     reply = await runtime.chat(orch, "hello")
     assert "OpenRouter API key" in reply.content
 
@@ -282,11 +283,11 @@ def test_router_trains_from_a_users_judged_runs_and_is_used():
         s.commit()
     assert router.train("u-router") == {"samples": 120, "tiers_trained": ["balanced", "fast"], "usable": True}
 
-    auto = Agent(user_id="u-router", name="Auto", tier="auto")
+    auto = Agent(user_id="u-router", room_id="r", name="Auto", tier="auto")
     creds = llm.creds("u-router")
     assert router.pick(auto, "Translate hello into Spanish", creds) == (settings.tier_fast, "fast", "learned")
     assert router.pick(auto, "Analyze the root cause of churn and plan a strategy", creds)[1:] == ("balanced", "learned")
-    assert router.pick(Agent(user_id="u-router", name="Pinned", tier="smart"), "hi", creds)[1:] == ("smart", "fixed")
+    assert router.pick(Agent(user_id="u-router", room_id="r", name="Pinned", tier="smart"), "hi", creds)[1:] == ("smart", "fixed")
 
 
 def test_benchmark_replay_scores_policies_correctly():
@@ -298,3 +299,83 @@ def test_benchmark_replay_scores_policies_correctly():
     assert res["learned"]["pass_rate"] >= 0.95
     assert res["learned"]["cost_vs_smart"] < -0.7
     assert res["learned"]["cost"] <= res["heuristic"]["cost"]
+
+
+# ------------------------------ rooms ------------------------------
+
+async def test_rooms_are_separate_teams_that_share_knowledge_boxes():
+    t = await team("u-rooms")                       # demo team lives in the first room
+    main = ensure_user("u-rooms")
+    side = create_room("u-rooms", "Side project")
+    c = TestClient(app)
+    h = {"X-User": "u-rooms"}
+
+    rooms = c.get("/api/rooms", headers=h).json()
+    assert [(r["name"], r["agents"]) for r in rooms] == [("Main room", 5), ("Side project", 1)]
+
+    side_state = c.get(f"/api/state?room_id={side.id}", headers=h).json()
+    assert [a["name"] for a in side_state["agents"]] == ["Jarvis"]   # its own orchestrator, nobody else
+    assert len(side_state["boxes"]) == 3                             # boxes are account-wide
+
+    # An agent in the side room can be granted a box created for the main room's team.
+    east_list = next(b["id"] for b in side_state["boxes"] if b["name"] == "Call List East")
+    scout = c.post("/api/agents", json={"room_id": side.id, "name": "Scout", "role": "East region researcher",
+                                        "box_ids": [east_list]}, headers=h).json()
+    assert (await rag.search(KEY, scout["id"], "Harbor Logistics"))[0]["box"] == "Call List East"
+
+    # The side room's orchestrator only sees and delegates to its own room.
+    side_jarvis = orchestrator(side.id)
+    reply = await runtime.chat(side_jarvis, "East region researcher: find the Harbor Logistics contact")
+    assert "Delegated to Scout" in reply.content
+    await runtime.idle()
+    assert {x.room_id for x in tasks_of("u-rooms")} == {side.id}
+    main_state = c.get(f"/api/state?room_id={main.id}", headers=h).json()
+    assert main_state["tasks"] == [] and main_state["messages"] == []
+    assert "Scout" not in [a["name"] for a in main_state["agents"]]
+
+    # A parent from another room is refused (falls back to the orchestrator).
+    moved = c.patch(f"/api/agents/{scout['id']}", json={"parent_id": t["Morgan"].id}, headers=h).json()
+    assert moved["parent_id"] is None
+
+    # Deleting a room removes its team and history, keeps the boxes, and the last room cannot go.
+    assert c.delete(f"/api/rooms/{side.id}", headers=h).json() == {"ok": True}
+    assert len(c.get("/api/state", headers=h).json()["boxes"]) == 3
+    with session() as s:
+        assert s.get(Agent, scout["id"]) is None
+    assert c.delete(f"/api/rooms/{main.id}", headers=h).status_code == 422
+    assert c.get(f"/api/state?room_id={main.id}", headers={"X-User": "someone-else"}).status_code == 404
+
+
+def test_migration_upgrades_a_pre_rooms_database_in_place(tmp_path):
+    """An existing database (created before migrations, like a live Supabase) keeps its data."""
+    import sqlalchemy as sa
+    from alembic import command
+    from alembic.config import Config
+
+    url = f"sqlite:///{tmp_path / 'old.db'}"
+    engine = sa.create_engine(url)
+    cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+    with engine.begin() as conn:  # build the old schema exactly as migration 0001 defines it
+        cfg.attributes["connection"] = conn
+        command.upgrade(cfg, "0001")
+        conn.execute(sa.text("DROP TABLE alembic_version"))  # old databases have no version table
+        conn.execute(sa.text('INSERT INTO "user" (id, openrouter_key, key_hint, judge_enabled, router_mode, explore_rate) '
+                             "VALUES ('old-user', '', '', 1, 'heuristic', 0.1)"))
+        conn.execute(sa.text("INSERT INTO agent (id, user_id, name, role, instructions, tier, tools, is_orchestrator, created_at) "
+                             "VALUES ('a1', 'old-user', 'Jarvis', '', '', 'balanced', '[]', 1, '2026-01-01')"))
+        conn.execute(sa.text("INSERT INTO message (id, user_id, sender, recipient, kind, content, created_at) "
+                             "VALUES ('m1', 'old-user', 'user', 'a1', 'chat', 'hi', '2026-01-01')"))
+
+    import app.db as appdb
+    original = appdb.engine
+    appdb.engine = engine
+    try:
+        appdb.init_db()
+    finally:
+        appdb.engine = original
+    with engine.connect() as conn:
+        room = conn.execute(sa.text("SELECT id, name FROM room WHERE user_id = 'old-user'")).one()
+        assert room.name == "Main room"
+        assert conn.execute(sa.text("SELECT room_id FROM agent WHERE id = 'a1'")).scalar() == room.id
+        assert conn.execute(sa.text("SELECT room_id FROM message WHERE id = 'm1'")).scalar() == room.id
+        assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() == "0002"

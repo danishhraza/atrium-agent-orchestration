@@ -71,9 +71,10 @@ def _str(desc: str) -> dict:
     return {"type": "string", "description": desc}
 
 
-def find_agent(user_id: str, ref: str) -> Agent | None:
+def find_agent(room_id: str, ref: str) -> Agent | None:
+    """Agents can only reach teammates in their own room."""
     with session() as s:
-        agents = s.exec(select(Agent).where(Agent.user_id == user_id)).all()
+        agents = s.exec(select(Agent).where(Agent.room_id == room_id)).all()
     ref = (ref or "").strip().lower()
     return next((a for a in agents if a.id == ref or a.name.lower() == ref), None)
 
@@ -148,15 +149,15 @@ async def search_knowledge(ctx: Ctx, query: str) -> str:
       {"agent": _str("teammate name or id"), "message": _str("your question, with all the context they need")},
       ["agent", "message"])
 async def message_agent(ctx: Ctx, agent: str, message: str) -> str:
-    target = find_agent(ctx.agent.user_id, agent)
+    target = find_agent(ctx.agent.room_id, agent)
     if not target or target.id == ctx.agent.id:
         return f"Error: no teammate called '{agent}'."
     rt, me = ctx.rt, ctx.agent
     task_id = ctx.task.id if ctx.task else None
-    rt.say(me.user_id, me.id, target.id, "consult", message, task_id=task_id)
+    rt.say(me, me.id, target.id, "consult", message, task_id=task_id)
     rt.set_state(me, "talking", f"asking {target.name}", peer=target.id)
     run = await rt.run(target, f"Message from your teammate {me.name}:\n{message}", mode="consult", depth=ctx.depth + 1)
-    rt.say(me.user_id, target.id, me.id, "reply", run.text, task_id=task_id)
+    rt.say(me, target.id, me.id, "reply", run.text, task_id=task_id)
     for k in ctx.usage:  # the teammate's spend counts toward the run that asked
         ctx.usage[k] += run.ctx.usage[k]
     return run.text
@@ -167,7 +168,7 @@ async def message_agent(ctx: Ctx, agent: str, message: str) -> str:
       {"agent": _str("teammate name or id"), "notes": _str("what you did, what is left, anything they need to know")},
       ["agent", "notes"])
 async def handoff_task(ctx: Ctx, agent: str, notes: str) -> str:
-    target = find_agent(ctx.agent.user_id, agent)
+    target = find_agent(ctx.agent.room_id, agent)
     if not target or target.id == ctx.agent.id or target.is_orchestrator:
         return f"Error: cannot hand off to '{agent}'."
     task = ctx.task
@@ -180,7 +181,7 @@ async def handoff_task(ctx: Ctx, agent: str, notes: str) -> str:
     task.status = "pending"
     task.brief += f"\n\n[Handoff from {ctx.agent.name}]: {notes}"
     ctx.rt.save_task(task)
-    ctx.rt.say(ctx.agent.user_id, ctx.agent.id, target.id, "handoff", notes, task_id=task.id)
+    ctx.rt.say(ctx.agent, ctx.agent.id, target.id, "handoff", notes, task_id=task.id)
     ctx.handed_off = True
     return f"Handed off to {target.name}."
 
@@ -192,29 +193,29 @@ async def handoff_task(ctx: Ctx, agent: str, notes: str) -> str:
       ["agent", "title", "brief"])
 async def delegate_task(ctx: Ctx, agent: str, title: str, brief: str) -> str:
     me, rt = ctx.agent, ctx.rt
-    target = find_agent(me.user_id, agent)
+    target = find_agent(me.room_id, agent)
     if not target or target.id == me.id or target.is_orchestrator:
         return f"Error: no agent called '{agent}' to delegate to."
     if not me.is_orchestrator and target.parent_id != me.id:
         return f"Error: {target.name} does not report to you."
     if ctx.task is None:  # first delegation of a chat turn opens a mission to hang the subtasks on
-        ctx.task = Task(id=ctx.mission_id or new_id(), user_id=me.user_id, title=ctx.text[:80], brief=ctx.text,
+        ctx.task = Task(id=ctx.mission_id or new_id(), user_id=me.user_id, room_id=me.room_id, title=ctx.text[:80], brief=ctx.text,
                         status="in_progress", assignee_id=me.id)
         rt.save_task(ctx.task)
-    sub = Task(user_id=me.user_id, title=title, brief=brief, assignee_id=target.id,
+    sub = Task(user_id=me.user_id, room_id=me.room_id, title=title, brief=brief, assignee_id=target.id,
                created_by=me.id, parent_id=ctx.task.id)
     rt.save_task(sub)
     ctx.spawned.append(sub.id)
-    rt.say(me.user_id, me.id, target.id, "delegate", f"{title}\n{brief}", task_id=sub.id)
+    rt.say(me, me.id, target.id, "delegate", f"{title}\n{brief}", task_id=sub.id)
     return f"Delegated to {target.name} (task {sub.id})."
 
 
 @tool("team_status", "See what every agent is doing right now, plus open and recently finished tasks.")
 async def team_status(ctx: Ctx) -> str:
-    uid = ctx.agent.user_id
+    rid = ctx.agent.room_id
     with session() as s:
-        agents = s.exec(select(Agent).where(Agent.user_id == uid)).all()
-        tasks = s.exec(select(Task).where(Task.user_id == uid).order_by(Task.updated_at.desc()).limit(30)).all()
+        agents = s.exec(select(Agent).where(Agent.room_id == rid)).all()
+        tasks = s.exec(select(Task).where(Task.room_id == rid).order_by(Task.updated_at.desc()).limit(30)).all()
     names = {a.id: a.name for a in agents}
     lines = ["AGENTS"]
     for a in agents:
@@ -232,16 +233,16 @@ async def team_status(ctx: Ctx) -> str:
 @tool("read_comms", "Read recent messages between agents (delegations, handoffs, consultations, results).",
       {"agent": _str("optional: only messages involving this agent")})
 async def read_comms(ctx: Ctx, agent: str = "") -> str:
-    uid = ctx.agent.user_id
+    rid = ctx.agent.room_id
     with session() as s:
-        q = select(Message).where(Message.user_id == uid, Message.sender != "user", Message.recipient != "user")
+        q = select(Message).where(Message.room_id == rid, Message.sender != "user", Message.recipient != "user")
         if agent:
-            target = find_agent(uid, agent)
+            target = find_agent(rid, agent)
             if not target:
                 return f"Error: no agent called '{agent}'."
             q = q.where(or_(Message.sender == target.id, Message.recipient == target.id))
         msgs = s.exec(q.order_by(Message.created_at.desc()).limit(20)).all()
-        names = {a.id: a.name for a in s.exec(select(Agent).where(Agent.user_id == uid)).all()}
+        names = {a.id: a.name for a in s.exec(select(Agent).where(Agent.room_id == rid)).all()}
     if not msgs:
         return "No messages between agents yet."
     return "\n".join(f"{names.get(m.sender, '?')} -> {names.get(m.recipient, '?')} [{m.kind}]: {m.content[:300]}"
@@ -251,9 +252,9 @@ async def read_comms(ctx: Ctx, agent: str = "") -> str:
 @tool("retry_failed", "Resume the most recent failed work. Only the tasks that failed are run again, by the same "
       "agents; finished tasks keep their results and the final report is rewritten when they are done.")
 async def retry_failed(ctx: Ctx) -> str:
-    uid = ctx.agent.user_id
+    rid = ctx.agent.room_id
     with session() as s:
-        failed = s.exec(select(Task).where(Task.user_id == uid, Task.status == "failed")
+        failed = s.exec(select(Task).where(Task.room_id == rid, Task.status == "failed")
                         .order_by(Task.updated_at.desc())).all()
     if not failed:
         return "Nothing has failed; there is nothing to retry."

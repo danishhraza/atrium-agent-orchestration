@@ -118,6 +118,10 @@ input[type="range"] { padding: 0; border: none; accent-color: var(--violet); }
 /* ================= HUD ================= */
 .hud { position: absolute; background: #fffffff2; border: 3px solid var(--ink); border-radius: 18px; box-shadow: 0 5px 0 var(--ink); z-index: 4000; }
 .hud.top { left: 14px; top: 14px; right: 442px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; flex-wrap: wrap; }
+.roommenu { display: flex; gap: 6px; align-items: center; }
+.roommenu select { width: auto; max-width: 200px; padding: 5px 10px; font-weight: 800; }
+.roommenu input { width: 180px; padding: 5px 10px; }
+.roommenu button { padding: 5px 10px; }
 .logo { font-weight: 900; font-size: 20px; letter-spacing: .02em; margin-right: 4px; }
 .hud.banner { left: 50%; top: 84px; transform: translateX(calc(-50% - 214px)); padding: 8px 14px; display: flex; gap: 10px; align-items: center;
   background: var(--yellow); max-width: calc(100% - 480px); }

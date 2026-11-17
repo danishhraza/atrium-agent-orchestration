@@ -68,7 +68,7 @@ async def fresh_team() -> dict[str, Agent]:
         me.openrouter_key, me.judge_enabled, me.explore_rate = security.encrypt(KEY), False, 0.0
         s.add(me)
         s.commit()
-    await seed_demo(user, KEY)
+    await seed_demo(user, ensure_user(user).id, KEY)
     with session() as s:
         return {a.name: a for a in s.exec(select(Agent).where(Agent.user_id == user)).all()}
 

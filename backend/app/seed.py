@@ -33,24 +33,24 @@ Pacific Solar Co - contact Marcus Hale, CRO - 200 reps - needs SSO and an uptime
 Tidewater Brewing - contact Jo Alvarez, owner - 4 reps - first CRM, wants something simple."""
 
 
-async def seed_demo(user_id: str, key: str) -> list[str]:
+async def seed_demo(user_id: str, room_id: str, key: str) -> list[str]:
     with session() as s:
-        if s.exec(select(Agent).where(Agent.user_id == user_id, Agent.is_orchestrator == False)).first():  # noqa: E712
+        if s.exec(select(Agent).where(Agent.room_id == room_id, Agent.is_orchestrator == False)).first():  # noqa: E712
             return []
         boxes = {name: Box(user_id=user_id, name=name, description=desc) for name, desc in [
             ("Product Docs", "pricing and objection handling"),
             ("Call List East", "East region prospects"),
             ("Call List West", "West region prospects"),
         ]}
-        lead = Agent(user_id=user_id, name="Morgan", tier="smart",
+        lead = Agent(user_id=user_id, room_id=room_id, name="Morgan", tier="smart",
                      role="Sales lead: plans outreach campaigns and coordinates the regional reps")
         s.add_all([*boxes.values(), lead])
         s.flush()
-        east = Agent(user_id=user_id, name="Eli", parent_id=lead.id, tier="auto",
+        east = Agent(user_id=user_id, room_id=room_id, name="Eli", parent_id=lead.id, tier="auto",
                      role="Sales rep for the East region: knows the East call list and drafts outreach to those prospects")
-        west = Agent(user_id=user_id, name="Wren", parent_id=lead.id, tier="auto",
+        west = Agent(user_id=user_id, room_id=room_id, name="Wren", parent_id=lead.id, tier="auto",
                      role="Sales rep for the West region: knows the West call list and drafts outreach to those prospects")
-        analyst = Agent(user_id=user_id, name="Quinn", tier="fast", tools=["calculator", "web_fetch", "current_time"],
+        analyst = Agent(user_id=user_id, room_id=room_id, name="Quinn", tier="fast", tools=["calculator", "web_fetch", "current_time"],
                         role="Pricing analyst: answers pricing and discount questions and does the math")
         s.add_all([east, west, analyst])
         s.flush()

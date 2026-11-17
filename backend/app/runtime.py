@@ -99,8 +99,10 @@ class Runtime:
         self.states[agent.id] = {"state": state, "detail": detail, "peer": peer}
         self.publish(agent.user_id, {"type": "state", "agent_id": agent.id, **self.states[agent.id]})
 
-    def say(self, user_id, sender, recipient, kind, content, task_id=None, trace_id=None) -> Message:
-        msg = Message(user_id=user_id, sender=sender, recipient=recipient, kind=kind, content=content,
+    def say(self, room: Agent | Task, sender, recipient, kind, content, task_id=None, trace_id=None) -> Message:
+        """Log a message. `room` is any agent or task in the room it belongs to."""
+        user_id = room.user_id
+        msg = Message(user_id=user_id, room_id=room.room_id, sender=sender, recipient=recipient, kind=kind, content=content,
                       task_id=task_id, trace_id=trace_id)
         with session() as s:
             s.add(msg)
@@ -146,7 +148,7 @@ class Runtime:
                   depth: int = 0, session_id: str | None = None, mission_id: str | None = None) -> Run:
         """One agent run: LLM turn -> tool calls -> LLM turn ... until it answers or hands off."""
         with session() as s:
-            team = list(s.exec(select(Agent).where(Agent.user_id == agent.user_id)).all())
+            team = list(s.exec(select(Agent).where(Agent.room_id == agent.room_id)).all())
         boxes = rag.allowed_boxes(agent.id)
         has_reports = any(a.parent_id == agent.id for a in team)
         tools = {t.name: t for t in tools_for(agent, mode, depth, bool(boxes), has_reports)}
@@ -227,17 +229,17 @@ class Runtime:
         """The user messages any agent and gets one reply. Work the agent delegates continues in the background."""
         uid = agent.user_id
         history = self._history(uid, agent.id)
-        self.say(uid, "user", agent.id, "chat", content)
+        self.say(agent, "user", agent.id, "chat", content)
         mission_id = new_id()
         try:
             run = await self.run(agent, content, mode="chat", history=history,
                                  session_id=mission_id, mission_id=mission_id)
         except Exception as e:
-            return self.say(uid, agent.id, "user", "chat", llm.friendly_error(e))
+            return self.say(agent, agent.id, "user", "chat", llm.friendly_error(e))
         mission = run.ctx.task
         if mission:
             mission.trace_id = run.trace_id
-        reply = self.say(uid, agent.id, "user", "chat", run.text,
+        reply = self.say(agent, agent.id, "user", "chat", run.text,
                          task_id=mission.id if mission else None, trace_id=run.trace_id)
         if mission:
             self._fan_out(mission, run.ctx.spawned)
@@ -286,7 +288,7 @@ class Runtime:
         if run and status == "done" and run.ctx.creds.judge_enabled:
             self._bg(self._judge(task, run), fresh_context=True)
         to_user = task.created_by == "user"
-        self.say(task.user_id, agent.id, task.created_by, "report" if to_user else "result", text,
+        self.say(task, agent.id, task.created_by, "report" if to_user else "result", text,
                  task_id=task.id, trace_id=trace_id)
         if task.parent_id:
             with session() as s:
@@ -332,7 +334,7 @@ class Runtime:
     async def synthesize(self, parent: Task, children: list[Task]) -> None:
         with session() as s:
             agent = s.get(Agent, parent.assignee_id)
-            names = {a.id: a.name for a in s.exec(select(Agent).where(Agent.user_id == parent.user_id)).all()}
+            names = {a.id: a.name for a in s.exec(select(Agent).where(Agent.room_id == parent.room_id)).all()}
         results = "\n\n".join(f"### {names.get(c.assignee_id, '?')} — {c.title} [{c.status}]\n{c.result}" for c in children)
         text = f"Original request:\n{parent.brief}\n\nResults from your team:\n\n{results}"
         try:

@@ -5,6 +5,7 @@ talk to one orchestrator ("Jarvis") that routes the work, tracks it and reports 
 watch the team work in a live clubhouse: agents nap at their desks, think, use tools, and walk over
 to each other to talk.
 
+- **Rooms**: run several separate teams, each with its own orchestrator, agents, chat and tasks.
 - **Build any team**: 4 sales reps each with their own call list, a marketing pod, a research desk.
   Agents optionally report to a lead, who can delegate further.
 - **One point of contact**: ask Jarvis for anything, including "what's everyone working on?" and
@@ -58,7 +59,7 @@ One process serves the API and the built UI. To deploy:
 2. **Secret**: set `ATRIUM_SECRET_KEY` (command in `.env.example`). It encrypts users' API keys.
 3. **Database**: set `ATRIUM_DATABASE_URL` to a Postgres connection string (Neon and Supabase have free
    hosted tiers). It must be the `postgresql://...` URL, not an API key. On Supabase use the direct or
-   session-pooler connection (port 5432). Tables are created on first start, and document vectors live
+   session-pooler connection (port 5432). The app migrates the schema itself on start (Alembic), and document vectors live
    in the same database; there is no separate vector store to set up.
 4. **Host**: any Python host (Render, Railway, Fly). Build `frontend/`, then start
    `uvicorn app.main:app --host 0.0.0.0 --port $PORT` from `backend/`.
@@ -88,6 +89,8 @@ cd backend && uv run python -m evals.router_bench --limit 12
 ## Layout
 
 ```
+backend/app/db.py          tables (rooms, agents, tasks, ...) and startup migration
+backend/migrations/        Alembic schema migrations
 backend/app/runtime.py     run loop, delegation fan-out, synthesis fan-in, live events
 backend/app/router.py      heuristic and learned difficulty routers
 backend/app/tools.py       tool registry: optional, knowledge, collaboration
@@ -108,6 +111,4 @@ frontend/src/Markdown.tsx  safe Markdown rendering of agent replies
   fixes on first contact.
 - **Single instance.** Missions in flight are lost if the server restarts, and two instances would not
   share live events. A durable queue and a pub/sub layer are the next step for scale.
-- **No schema migrations yet.** Tables are created on start; add Alembic before changing models in
-  production.
 - **Retrieval is a brute-force scan** per search. Fine for thousands of chunks; move to pgvector beyond that.

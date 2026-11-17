@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import {
-  api, connect, type Agent, type Box, type Config, type Event, type Message, type Model, type RouterStats,
+  api, connect, type Agent, type Box, type Config, type Event, type Message, type Model, type RoomInfo, type RouterStats,
   type Settings, type StatRow, type Task,
 } from "./api";
 import Markdown from "./Markdown";
@@ -12,6 +12,61 @@ const TIERS = ["fast", "balanced", "smart"];
 
 function upsert<T extends { id: string }>(list: T[], item: T): T[] {
   return list.some((x) => x.id === item.id) ? list.map((x) => (x.id === item.id ? item : x)) : [...list, item];
+}
+
+const ROOM_KEY = "atrium.room";
+function savedRoom(): string | null {
+  try { return localStorage.getItem(ROOM_KEY); } catch { return null; }
+}
+function rememberRoom(id: string) {
+  try { localStorage.setItem(ROOM_KEY, id); } catch { /* private mode: just don't remember */ }
+}
+
+/** Switch, create, rename and delete rooms. Each room is its own team with its own Jarvis. */
+function RoomMenu({ rooms, current, onSwitch, run, onError }: {
+  rooms: RoomInfo[]; current: RoomInfo | null; onSwitch: (id: string) => void; run: Run; onError: (e: string) => void;
+}) {
+  const [mode, setMode] = useState<"" | "new" | "rename">("");
+  const [name, setName] = useState("");
+  const close = () => { setMode(""); setName(""); };
+  const submit = async () => {
+    const n = name.trim();
+    if (!n) return;
+    try {
+      if (mode === "new") onSwitch((await api.createRoom(n)).id);
+      else if (current) await run(() => api.renameRoom(current.id, n));
+      close();
+    } catch (e) { onError((e as Error).message); }
+  };
+  const remove = () => {
+    if (!current) return;
+    if (!confirm(`Delete "${current.name}"? Its agents, tasks and conversation are deleted. Knowledge boxes are kept.`)) return;
+    api.deleteRoom(current.id)
+      .then(() => onSwitch(rooms.find((r) => r.id !== current.id)!.id))
+      .catch((e) => onError(e.message));
+  };
+
+  if (mode) {
+    return (
+      <div className="roommenu">
+        <input autoFocus value={name} placeholder={mode === "new" ? "New room name" : "Rename room"} aria-label="Room name"
+               onChange={(e) => setName(e.target.value)}
+               onKeyDown={(e) => { if (e.key === "Enter") submit(); if (e.key === "Escape") close(); }} />
+        <button className="primary" disabled={!name.trim()} onClick={submit}>{mode === "new" ? "Create" : "Save"}</button>
+        <button onClick={close}>Cancel</button>
+      </div>
+    );
+  }
+  return (
+    <div className="roommenu">
+      <select value={current?.id ?? ""} onChange={(e) => onSwitch(e.target.value)} aria-label="Room">
+        {rooms.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+      </select>
+      <button onClick={() => setMode("new")} title="New room">+ Room</button>
+      <button onClick={() => { setName(current?.name ?? ""); setMode("rename"); }} title="Rename room" aria-label="Rename room">✎</button>
+      {rooms.length > 1 && <button className="danger" onClick={remove} title="Delete room" aria-label="Delete room">🗑</button>}
+    </div>
+  );
 }
 
 export default function App({ account }: { account: ReactNode }) {
@@ -28,13 +83,26 @@ export default function App({ account }: { account: ReactNode }) {
   const [bubbles, setBubbles] = useState<Record<string, string>>({});
   const [packets, setPackets] = useState<Packet[]>([]);
   const [error, setError] = useState("");
+  const [rooms, setRooms] = useState<RoomInfo[]>([]);
+  const [room, setRoom] = useState<RoomInfo | null>(null);
+  const roomId = useRef<string | null>(savedRoom());
 
   const refresh = useCallback(async () => {
     try {
-      const s = await api.state();
+      let s;
+      try {
+        s = await api.state(roomId.current);
+      } catch {  // the remembered room was deleted (or belongs to another login): fall back to the first room
+        roomId.current = null;
+        s = await api.state(null);
+      }
+      roomId.current = s.room.id;
+      rememberRoom(s.room.id);
+      setRoom(s.room);
+      api.rooms().then(setRooms).catch(() => {});
       setAgents(s.agents); setBoxes(s.boxes); setTasks(s.tasks); setMessages(s.messages);
       setSettings(s.settings); setConfig(s.config);
-      setSelected((cur) => cur ?? s.agents.find((a) => a.is_orchestrator)?.id ?? null);
+      setSelected((cur) => (cur && s.agents.some((a) => a.id === cur) ? cur : s.agents.find((a) => a.is_orchestrator)?.id ?? null));
       setError("");
     } catch (e) {
       setError((e as Error).message);
@@ -46,9 +114,10 @@ export default function App({ account }: { account: ReactNode }) {
       if (e.type === "state") {
         setAgents((list) => list.map((a) => (a.id === e.agent_id ? { ...a, state: e.state, detail: e.detail, peer: e.peer } : a)));
       } else if (e.type === "task") {
-        setTasks((list) => upsert(list, e.task));
+        if (e.task.room_id === roomId.current) setTasks((list) => upsert(list, e.task));
       } else {
         const m = e.message;
+        if (m.room_id !== roomId.current) return;  // events from your other rooms
         const snippet = m.content.slice(0, 90);
         setMessages((list) => upsert(list, m));
         setPackets((list) => [...list, { id: m.id, from: m.sender, to: m.recipient, kind: m.kind }]);
@@ -65,6 +134,12 @@ export default function App({ account }: { account: ReactNode }) {
   const run: Run = async (fn) => {
     try { await fn(); await refresh(); } catch (e) { setError((e as Error).message); }
   };
+  const switchRoom = (id: string) => {
+    roomId.current = id;
+    rememberRoom(id);
+    setSelected(null); setTab("chat"); setBubbles({}); setPackets([]);
+    refresh();
+  };
   const name = (id: string) => (id === "user" ? "You" : agents.find((a) => a.id === id)?.name ?? "former agent");
   const current = agents.find((a) => a.id === selected);
   const openTasks = tasks.filter((t) => !["done", "failed"].includes(t.status)).length;
@@ -77,9 +152,10 @@ export default function App({ account }: { account: ReactNode }) {
 
       <header className="hud top">
         <div className="logo">Atrium</div>
+        <RoomMenu rooms={rooms} current={room} onSwitch={switchRoom} run={run} onError={setError} />
         {config?.langfuse && <span className="pill ok">Langfuse on</span>}
         <span className="grow" />
-        {agents.length === 1 && !needsKey && <button onClick={() => run(api.demo)}>Load demo team</button>}
+        {agents.length === 1 && !needsKey && <button onClick={() => room && run(() => api.demo(room.id))}>Load demo team</button>}
         <button className="primary" onClick={() => setEditing("new")}>+ New agent</button>
         <button onClick={() => setShowSettings(true)} aria-label="Settings">⚙ Settings</button>
         {account}
@@ -106,7 +182,7 @@ export default function App({ account }: { account: ReactNode }) {
       </aside>
 
       {editing && config && settings && (
-        <AgentEditor agent={editing === "new" ? null : editing} agents={agents} boxes={boxes} config={config}
+        <AgentEditor agent={editing === "new" ? null : editing} roomId={room?.id ?? ""} agents={agents} boxes={boxes} config={config}
                      tiers={settings.tiers} onClose={() => setEditing(null)} run={run} />
       )}
       {showSettings && settings && <SettingsModal settings={settings} onClose={() => setShowSettings(false)} run={run} />}
@@ -249,8 +325,8 @@ function Knowledge({ boxes, agents, run }: { boxes: Box[]; agents: Agent[]; run:
   );
 }
 
-function AgentEditor({ agent, agents, boxes, config, tiers, onClose, run }: {
-  agent: Agent | null; agents: Agent[]; boxes: Box[]; config: Config; tiers: Record<string, string>; onClose: () => void; run: Run;
+function AgentEditor({ agent, roomId, agents, boxes, config, tiers, onClose, run }: {
+  agent: Agent | null; roomId: string; agents: Agent[]; boxes: Box[]; config: Config; tiers: Record<string, string>; onClose: () => void; run: Run;
 }) {
   const [f, setF] = useState({
     name: agent?.name ?? "", role: agent?.role ?? "", instructions: agent?.instructions ?? "", tier: agent?.tier ?? "auto",
@@ -259,7 +335,7 @@ function AgentEditor({ agent, agents, boxes, config, tiers, onClose, run }: {
   const set = <K extends keyof typeof f>(k: K, v: (typeof f)[K]) => setF((cur) => ({ ...cur, [k]: v }));
   const toggle = (k: "tools" | "box_ids", v: string) => set(k, f[k].includes(v) ? f[k].filter((x) => x !== v) : [...f[k], v]);
   const orch = agent?.is_orchestrator;
-  const save = () => { run(() => api.saveAgent(agent?.id ?? null, f)); onClose(); };
+  const save = () => { run(() => api.saveAgent(agent?.id ?? null, agent ? f : { ...f, room_id: roomId })); onClose(); };
 
   return (
     <div className="overlay" onClick={onClose}>
